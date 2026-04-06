@@ -22,7 +22,7 @@ class JsonRpcRaw {
     final sw = Stopwatch()..start();
 
     try {
-      icLogger.d('$label [RPC] -> $method ($endpoint)');
+      //icLogger.d('$label [RPC] -> $method ($endpoint)');
 
       final res = await http
           .post(Uri.parse(endpoint), headers: headers, body: jsonEncode(payload))
@@ -44,7 +44,7 @@ class JsonRpcRaw {
         throw Exception('RPC error: $err');
       }
 
-      icLogger.d('$label [RPC] <- $method ok (${sw.elapsedMilliseconds}ms)');
+      //icLogger.d('$label [RPC] <- $method ok (${sw.elapsedMilliseconds}ms)');
       return body['result'];
     } catch (e) {
       if (sw.isRunning) sw.stop();

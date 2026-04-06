@@ -202,7 +202,11 @@ void main() async {
         ),
 
         // Winning number history
-        ChangeNotifierProvider(create: (_) => GameHistoryProvider(api: WinningHistoryApi())),
+        // Winning number history API
+        Provider<WinningHistoryApi>(create: (_) => WinningHistoryApi()),
+
+        // Winning number history
+        ChangeNotifierProvider(create: (ctx) => GameHistoryProvider(api: ctx.read<WinningHistoryApi>())),
 
         // Resolved game (API + chain)
         Provider<ResolvedGameApiService>(create: (_) => ResolvedGameApiService()),
@@ -300,10 +304,10 @@ void main() async {
             final p = PlayerPredictionsProvider(
               service: ctx.read<PlayerPredictionsService>(),
               profilePda: ctx.read<ProfilePdaProvider>(),
+              resolvedGameApi: ctx.read<ResolvedGameApiService>(),
             );
             p.attach();
             p.attachLiveFeed(ctx.read<LiveFeedProvider>());
-
             return p;
           },
           update: (ctx, profile, service, live, provider) {

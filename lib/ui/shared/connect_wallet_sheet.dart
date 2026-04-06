@@ -284,7 +284,7 @@ class _DisconnectRow extends StatelessWidget {
             onPressed: isBusy
                 ? null
                 : () async {
-                    await conn.disconnect(revoke: false);
+                    await conn.disconnect(revoke: conn.kind == WalletKind.seedVault);
                     if (context.mounted) Navigator.of(context).pop();
                   },
             style: OutlinedButton.styleFrom(

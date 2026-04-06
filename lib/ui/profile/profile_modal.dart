@@ -4,7 +4,6 @@ import 'package:iseefortune_flutter/models/prediction/prediciton_profile_row_vm.
 import 'package:iseefortune_flutter/models/profile/profile_prediction_context.dart';
 import 'package:iseefortune_flutter/models/profile/profile_view_model.dart';
 import 'package:iseefortune_flutter/providers/game/resolved_game_cache_provider.dart';
-import 'package:iseefortune_flutter/providers/game_history_provider.dart';
 import 'package:iseefortune_flutter/providers/live_feed_provider.dart';
 import 'package:iseefortune_flutter/providers/profile/profile_predictions_provider.dart';
 import 'package:iseefortune_flutter/providers/profile/profile_stats_provider.dart';
@@ -32,10 +31,9 @@ class ProfileModal extends StatelessWidget {
     // ------------------------
     final stats = context.watch<ProfileStatsProvider>().getCached(handle);
     final clock = context.watch<EpochClockService>();
-    final history = context.watch<GameHistoryProvider>();
     final ctx = ProfilePredictionContext(
       currentEpoch: BigInt.from(clock.state?.epoch ?? 0),
-      winningByEpoch: history.winningByEpoch,
+      winningByEpoch: const {},
     );
 
     // ------------------------
@@ -194,6 +192,7 @@ class ProfileModal extends StatelessWidget {
                 final activeChain = context
                     .read<LiveFeedProvider>()
                     .currentGameEpochOrZero; // == firstEpochInChain
+
                 final isInProgress = row.gameEpoch == activeChain;
 
                 if (isInProgress) {

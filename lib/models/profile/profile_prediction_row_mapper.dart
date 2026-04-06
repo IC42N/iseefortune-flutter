@@ -1,42 +1,42 @@
+import 'package:iseefortune_flutter/models/game_resolution/game_resolution_profile_result.dart';
 import 'package:iseefortune_flutter/models/prediction/prediction_model.dart';
 import 'package:iseefortune_flutter/models/prediction/prediction_row_core_vm.dart';
 import 'package:iseefortune_flutter/models/prediction/prediciton_profile_row_vm.dart';
 import 'package:iseefortune_flutter/models/profile/profile_prediction_context.dart';
+import 'package:iseefortune_flutter/utils/epoch_display.dart';
 
 // Profile predictions list
-// Maps from PredictionModel (core data from on-chain + API) to ProfilePredictionRowVM (UI-ready data for profile screen rows).
+// Maps from PredictionModel (core data from on-chain + API)
+// to ProfilePredictionRowVM (UI-ready data for profile screen rows).
 ProfilePredictionRowVM mapPredictionModelToProfileRow({
   required PredictionModel m,
-  required String predictionPda, // you likely know this from fetch result key
+  required String predictionPda,
   required ProfilePredictionContext ctx,
+  required ResolvedGameProfileResult? resolved,
   String playerLabel = '',
-  String? arweaveUrl,
-  int ticketsEarned = 0,
-  int? winningNumber,
-  BigInt? totalPotLamports,
-  BigInt? payoutLamports,
-  bool canClaim = false,
-  PredictionOutcome outcome = PredictionOutcome.progress,
 }) {
-  final epochLabel = m.epoch.toString();
-  final tierLabel = 'Tier ${m.tier}';
+  final epochLabel = formatEpochDisplay(firstEpochInChain: m.gameEpoch, epoch: m.epoch);
 
+  final tierLabel = 'Tier ${m.tier}';
   final picks = m.activeSelections;
 
-  final winningNumber = ctx.winningByEpoch[m.epoch];
+  final resolvedWinningNumber = resolved?.winningNumber;
+  final isResolved = resolved != null && resolvedWinningNumber != null;
 
-  // resolved if we have a winning number for that epoch
-  final isResolved = winningNumber != null;
+  final isWinner = isResolved && picks.contains(resolvedWinningNumber);
 
-  // winner if resolved and picks contains winning number
-  final isWinner = isResolved && picks.contains(winningNumber);
+  final PredictionOutcome derivedOutcome;
+  if (isResolved) {
+    derivedOutcome = isWinner ? PredictionOutcome.correct : PredictionOutcome.miss;
+  } else if (m.gameEpoch == ctx.currentEpoch) {
+    derivedOutcome = PredictionOutcome.progress;
+  } else {
+    // Past game with missing resolved row should be rare.
+    // Keep as progress until resolved data is available.
+    derivedOutcome = PredictionOutcome.progress;
+  }
 
-  final outcome = isResolved
-      ? (isWinner ? PredictionOutcome.correct : PredictionOutcome.miss)
-      : PredictionOutcome.progress;
-
-  // claimable only if won, resolved, and not already claimed
-  final canClaim = isWinner && !m.isClaimed;
+  final derivedCanClaim = isWinner && !m.isClaimed;
 
   final core = PredictionRowCore(
     pda: predictionPda,
@@ -53,16 +53,16 @@ ProfilePredictionRowVM mapPredictionModelToProfileRow({
     tier: m.tier,
     epochLabel: epochLabel,
     tierLabel: tierLabel,
-    outcome: outcome,
+    outcome: derivedOutcome,
     ticketsEarned: 0,
-    winningNumber: winningNumber,
+    winningNumber: resolvedWinningNumber,
     totalPotLamports: null,
     arweaveUrl: null,
     selections: picks,
     wagerLamports: m.lamports,
     createdAt: DateTime.fromMillisecondsSinceEpoch(m.placedAtTs * 1000, isUtc: true),
     payoutLamports: null,
-    canClaim: canClaim,
+    canClaim: derivedCanClaim,
     isClaimed: m.isClaimed,
   );
 }

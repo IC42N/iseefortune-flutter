@@ -1,9 +1,9 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:solana/base58.dart' show base58decode;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:iseefortune_flutter/solana/wallet/wallet_adapter_services.dart';
 import 'package:iseefortune_flutter/utils/logger.dart';
+import 'package:solana/base58.dart' show base58decode;
 import 'package:solana_seed_vault/solana_seed_vault.dart';
 
 enum WalletKind { mwa, seedVault }
@@ -11,15 +11,16 @@ enum WalletKind { mwa, seedVault }
 extension WalletKindStorage on WalletKind {
   String get storageValue => this == WalletKind.mwa ? 'mwa' : 'seed_vault';
 
-  static WalletKind? fromStorage(String? v) {
-    if (v == 'mwa') return WalletKind.mwa;
-    if (v == 'seed_vault') return WalletKind.seedVault;
+  static WalletKind? fromStorage(String? value) {
+    if (value == 'mwa') return WalletKind.mwa;
+    if (value == 'seed_vault') return WalletKind.seedVault;
     return null;
   }
 }
 
 class WalletConnectError {
   WalletConnectError(this.title, this.message, {this.debug});
+
   final String title;
   final String message;
   final String? debug;
@@ -28,15 +29,21 @@ class WalletConnectError {
   String toString() => '$title: $message';
 }
 
-/// A small “snapshot” of the current connected wallet lane + required signing metadata.
+/// Snapshot of the currently connected wallet lane plus whatever metadata is
+/// required later for signing.
+///
+/// - MWA uses a string auth token.
+/// - Seed Vault uses an integer auth token + account metadata.
 sealed class WalletSession {
   const WalletSession({required this.kind, required this.pubkey});
+
   final WalletKind kind;
   final String pubkey;
 }
 
 class MwaWalletSession extends WalletSession {
   const MwaWalletSession({required super.pubkey, required this.authToken}) : super(kind: WalletKind.mwa);
+
   final String authToken;
 }
 
@@ -53,6 +60,21 @@ class SeedVaultWalletSession extends WalletSession {
   final Uri derivationPath;
 }
 
+/// Owns wallet connection state for both supported lanes:
+/// - MWA
+/// - Solana Seed Vault
+///
+/// Responsibilities:
+/// - connect/disconnect
+/// - session persistence
+/// - best-effort restore on app launch
+/// - provide enough session metadata for later signing flows
+///
+/// Important Seed Vault note:
+/// Disconnecting with revoke=true intentionally deauthorizes currently
+/// authorized Seed Vault rows, then waits briefly for the provider to settle
+/// before clearing local state. Without that settle delay, immediate reconnects
+/// can fail even after a successful deauthorization.
 class WalletConnectionProvider extends ChangeNotifier {
   WalletConnectionProvider({required SolanaWalletAdapterService mwa, FlutterSecureStorage? storage})
     : _mwa = mwa,
@@ -61,11 +83,14 @@ class WalletConnectionProvider extends ChangeNotifier {
   final SolanaWalletAdapterService _mwa;
   final FlutterSecureStorage _storage;
 
+  // ---------------------------------------------------------------------------
   // Storage keys
+  // ---------------------------------------------------------------------------
+
   static const _kWalletKind = 'wallet_kind';
-  static const _kMWAPubkey = 'mwa_pubkey_b58';
 
   // MWA
+  static const _kMWAPubkey = 'mwa_pubkey_b58';
   static const _kMwaAuthToken = 'mwa_auth_token';
 
   // Seed Vault
@@ -74,13 +99,15 @@ class WalletConnectionProvider extends ChangeNotifier {
   static const _kSeedVaultAccountId = 'seed_vault_account_id';
   static const _kSeedVaultDerivationPath = 'seed_vault_derivation_path';
 
+  // ---------------------------------------------------------------------------
+  // In-memory state
+  // ---------------------------------------------------------------------------
+
   WalletKind? _kind;
   String? _pubkey;
 
-  // MWA in-memory
   String? _mwaAuthToken;
 
-  // Seed Vault in-memory
   int? _seedVaultAuthToken;
   int? _seedVaultAccountId;
   Uri? _seedVaultDerivationPath;
@@ -97,38 +124,47 @@ class WalletConnectionProvider extends ChangeNotifier {
   WalletKind? get kind => _kind;
   String? get pubkey => _pubkey;
 
-  bool get isConnecting => _isConnecting; // only connect flows
+  bool get isConnecting => _isConnecting;
   bool get isDisconnecting => _isDisconnecting;
   bool get isBusy => _isConnecting || _isDisconnecting;
   bool get isConnected => _pubkey != null;
+
   Object? get lastError => _lastError;
 
   WalletConnectError? get uiError =>
       _lastError is WalletConnectError ? _lastError as WalletConnectError : null;
 
   String? get mwaAuthToken => _mwaAuthToken;
-  String? get mwaAddressB58 => (_kind == WalletKind.mwa) ? _pubkey : null;
+  String? get mwaAddressB58 => _kind == WalletKind.mwa ? _pubkey : null;
+
   int? get seedVaultAuthToken => _seedVaultAuthToken;
   int? get seedVaultAccountId => _seedVaultAccountId;
   Uri? get seedVaultDerivationPath => _seedVaultDerivationPath;
 
   WalletSession? get session {
-    final k = _kind;
-    final pk = _pubkey;
-    if (k == null || pk == null) return null;
+    final currentKind = _kind;
+    final currentPubkey = _pubkey;
+    if (currentKind == null || currentPubkey == null) return null;
 
-    switch (k) {
+    switch (currentKind) {
       case WalletKind.mwa:
-        final t = _mwaAuthToken;
-        if (t == null || t.isEmpty) return null;
-        return MwaWalletSession(pubkey: pk, authToken: t);
+        final token = _mwaAuthToken;
+        if (token == null || token.isEmpty) return null;
+        return MwaWalletSession(pubkey: currentPubkey, authToken: token);
 
       case WalletKind.seedVault:
-        final a = _seedVaultAuthToken;
-        final id = _seedVaultAccountId;
-        final dp = _seedVaultDerivationPath;
-        if (a == null || id == null || dp == null) return null;
-        return SeedVaultWalletSession(pubkey: pk, authToken: a, accountId: id, derivationPath: dp);
+        final token = _seedVaultAuthToken;
+        final accountId = _seedVaultAccountId;
+        final path = _seedVaultDerivationPath;
+
+        if (token == null || accountId == null || path == null) return null;
+
+        return SeedVaultWalletSession(
+          pubkey: currentPubkey,
+          authToken: token,
+          accountId: accountId,
+          derivationPath: path,
+        );
     }
   }
 
@@ -144,7 +180,7 @@ class WalletConnectionProvider extends ChangeNotifier {
         raw.contains('solana-wallet:')) {
       return WalletConnectError(
         'No wallet app found',
-        'Install a Solana wallet that supports Mobile Wallet Adapter (MWA) (ex: Phantom, Backpack) and try again.',
+        'Install a Solana wallet that supports Mobile Wallet Adapter (MWA), such as Phantom or Backpack, and try again.',
         debug: raw,
       );
     }
@@ -157,14 +193,20 @@ class WalletConnectionProvider extends ChangeNotifier {
   }
 
   // ---------------------------------------------------------------------------
-  // Auto restore (best effort)
+  // Auto restore
   // ---------------------------------------------------------------------------
 
+  /// Best-effort restore on app launch.
+  ///
+  /// MWA:
+  /// - restores UI state
+  /// - restores local session into the MWA service if a token exists
+  ///
+  /// Seed Vault:
+  /// - attempts to restore the previously persisted Seed Vault token/account
+  /// - failures are expected on some boots and should not hard-fail the app
   Future<void> tryAutoConnect() async {
     if (_isConnecting) return;
-
-    icLogger.i('[WalletConnection] tryAutoConnect called');
-    icLogger.i('[WalletConnection] pubkey=$_pubkey kind=$_kind canSign=${session != null}');
 
     final savedKindStr = await _storage.read(key: _kWalletKind);
     final savedKind = WalletKindStorage.fromStorage(savedKindStr);
@@ -175,16 +217,12 @@ class WalletConnectionProvider extends ChangeNotifier {
       WalletKind.seedVault => await _storage.read(key: _kSeedVaultPubkey),
     };
 
-    // optimistic UI
+    // Optimistic UI restore so the app can render quickly.
     if (savedPubkey != null && savedPubkey.isNotEmpty) {
       _pubkey = savedPubkey;
       _kind = savedKind;
       notifyListeners();
     }
-
-    icLogger.i(
-      '[WalletConnection] after optimistic restore pubkey=$_pubkey kind=$_kind canSign=${session != null}',
-    );
 
     _isConnecting = true;
     _lastError = null;
@@ -193,26 +231,25 @@ class WalletConnectionProvider extends ChangeNotifier {
     try {
       switch (savedKind) {
         case WalletKind.mwa:
-          final savedMwaToken = await _storage.read(key: _kMwaAuthToken);
-          final savedMwaPubkey = await _storage.read(key: _kMWAPubkey);
+          final savedToken = await _storage.read(key: _kMwaAuthToken);
+          final savedPubkey = await _storage.read(key: _kMWAPubkey);
 
-          if (savedMwaPubkey == null || savedMwaPubkey.isEmpty) {
+          if (savedPubkey == null || savedPubkey.isEmpty) {
             await _clearPersisted();
             _resetInMemory();
             return;
           }
 
-          // Only restore UI state (NOT signing capability)
           _kind = WalletKind.mwa;
-          _pubkey = savedMwaPubkey;
-          _mwaAuthToken = savedMwaToken;
+          _pubkey = savedPubkey;
+          _mwaAuthToken = savedToken;
 
-          if (savedMwaToken != null && savedMwaToken.isNotEmpty) {
-            final pkBytes = Uint8List.fromList(base58decode(savedMwaPubkey));
+          if (savedToken != null && savedToken.isNotEmpty) {
+            final pkBytes = Uint8List.fromList(base58decode(savedPubkey));
             if (pkBytes.length == 32) {
               _mwa.restoreLocalSession(
-                authToken: savedMwaToken,
-                activeAddressB58: savedMwaPubkey,
+                authToken: savedToken,
+                activeAddressB58: savedPubkey,
                 activePubkeyBytes: pkBytes,
               );
             }
@@ -222,8 +259,8 @@ class WalletConnectionProvider extends ChangeNotifier {
           return;
 
         case WalletKind.seedVault:
-          final ok = await _tryRestoreSeedVault();
-          if (!ok) {
+          final restored = await _tryRestoreSeedVault();
+          if (!restored) {
             _clearSeedVaultSigningOnlyMemory();
             notifyListeners();
           }
@@ -238,7 +275,7 @@ class WalletConnectionProvider extends ChangeNotifier {
           icLogger.w('[WalletConnection] autoconnect failed');
         }
       } else {
-        // SeedVault boot failures are expected; do NOT delete persisted token.
+        // Expected sometimes for Seed Vault on boot / process restore.
         icLogger.i('[WalletConnection] SeedVault autoconnect failed (expected): $e');
         _clearSeedVaultSigningOnlyMemory();
       }
@@ -260,7 +297,6 @@ class WalletConnectionProvider extends ChangeNotifier {
     notifyListeners();
 
     try {
-      // SolanaWalletAdapterService handles initIdentity internally via init()
       icLogger.i('[MWA] starting authorize()');
       final res = await _mwa.authorize();
       icLogger.i('[MWA] authorize() done res=${res != null}');
@@ -279,7 +315,7 @@ class WalletConnectionProvider extends ChangeNotifier {
       await _storage.write(key: _kMWAPubkey, value: _pubkey);
     } catch (e, st) {
       icLogger.e('[MWA] connect error: $e\n$st');
-      _lastError = (e is WalletConnectError) ? e : _mapConnectError(e);
+      _lastError = e is WalletConnectError ? e : _mapConnectError(e);
     } finally {
       _isConnecting = false;
       notifyListeners();
@@ -289,6 +325,15 @@ class WalletConnectionProvider extends ChangeNotifier {
   // ---------------------------------------------------------------------------
   // User-initiated Seed Vault connect
   // ---------------------------------------------------------------------------
+
+  /// Connects through Solana Seed Vault.
+  ///
+  /// Connection strategy:
+  /// 1. Try restoring the previously persisted Seed Vault token/account
+  /// 2. Try matching any already-authorized seed session
+  /// 3. Fall back to interactive authorize flow
+  ///
+  /// This lets us prefer stable reconnects before prompting the user again.
   Future<void> connectSeedVault() async {
     if (_isConnecting) return;
 
@@ -307,14 +352,11 @@ class WalletConnectionProvider extends ChangeNotifier {
         throw WalletConnectError('Seed Vault unavailable', 'Seed Vault is not available on this device.');
       }
 
-      final hasPerm = await seedVault.checkPermission();
-      if (!hasPerm) {
+      final hasPermission = await seedVault.checkPermission();
+      if (!hasPermission) {
         warn('checkPermission() == false (continuing anyway)');
       }
 
-      // -----------------------------------------------------------------------
-      // Read what we previously pinned to (if anything)
-      // -----------------------------------------------------------------------
       final savedPubkey = await _storage.read(key: _kSeedVaultPubkey);
       final savedIdStr = await _storage.read(key: _kSeedVaultAccountId);
       final savedId = int.tryParse(savedIdStr ?? '');
@@ -322,46 +364,35 @@ class WalletConnectionProvider extends ChangeNotifier {
 
       log('saved pin: savedId=$savedId savedPubkey=$savedPubkey savedDp=$savedDpStr');
 
-      // -----------------------------------------------------------------------
-      // 1) Silent restore/pin first (NO UI)
-      //    - This prevents "random" changes when multiple seeds/accounts exist.
-      // -----------------------------------------------------------------------
-      final ok = await _tryRestoreSeedVault();
-      if (ok) {
-        log(
-          'silent restore OK: pinned acct=$_seedVaultAccountId pubkey=$_pubkey dp=$_seedVaultDerivationPath',
-        );
+      // 1) Silent restore first.
+      final restored = await _tryRestoreSeedVault();
+      if (restored) {
+        log('silent restore OK: acct=$_seedVaultAccountId pubkey=$_pubkey dp=$_seedVaultDerivationPath');
 
-        // Persist wallet kind + pubkey to ensure UI + app state stays correct.
         await _storage.write(key: _kWalletKind, value: WalletKind.seedVault.storageValue);
         await _storage.write(key: _kSeedVaultPubkey, value: _pubkey);
 
-        // Switching lanes
         _mwaAuthToken = null;
         await _storage.delete(key: _kMwaAuthToken);
 
         notifyListeners();
         return;
-      } else {
-        log('silent restore failed (expected on some boots). Will try other authorized seed sessions…');
       }
 
-      // -----------------------------------------------------------------------
-      // 2) Try other already-authorized seed sessions (NO UI)
-      //    - If multiple auth tokens exist, pick the one matching saved pubkey/id.
-      // -----------------------------------------------------------------------
+      log('silent restore failed. Will try other authorized seed sessions…');
+
+      // 2) Try matching an existing authorized Seed Vault session.
       final match = await _findMatchingAuthorizedSeedSession();
       if (match != null) {
         final token = match.$1;
-        final acct = match.$2;
+        final account = match.$2;
 
         log(
-          'matched authorized seed session: token=$token acctId=${acct.id} pk=${acct.publicKeyEncoded} dp=${acct.derivationPath}',
+          'matched authorized seed session: token=$token acctId=${account.id} pk=${account.publicKeyEncoded} dp=${account.derivationPath}',
         );
 
-        await _commitSeedVaultSession(token, acct);
+        await _commitSeedVaultSession(token, account);
 
-        // Switching lanes
         _mwaAuthToken = null;
         await _storage.delete(key: _kMwaAuthToken);
 
@@ -369,13 +400,11 @@ class WalletConnectionProvider extends ChangeNotifier {
           'committed matched session: acct=$_seedVaultAccountId pubkey=$_pubkey dp=$_seedVaultDerivationPath',
         );
         return;
-      } else {
-        log('no matching authorized seed session found. Falling back to interactive authorize…');
       }
 
-      // -----------------------------------------------------------------------
-      // 3) Last resort: interactive authorization
-      // -----------------------------------------------------------------------
+      log('no matching authorized seed session found. Falling back to interactive authorize…');
+
+      // 3) Interactive authorize.
       const purpose = Purpose.signSolanaTransaction;
 
       final AuthToken newToken;
@@ -401,18 +430,7 @@ class WalletConnectionProvider extends ChangeNotifier {
       }
 
       log('interactive token=$newToken accounts=${accounts.length}');
-      for (final a in accounts) {
-        log('acct: id=${a.id} user=${a.isUserWallet} pk=${a.publicKeyEncoded} dp=${a.derivationPath}');
-      }
 
-      // -----------------------------------------------------------------------
-      // Deterministic selection:
-      //   1) saved accountId
-      //   2) saved pubkey
-      //   3) default Solana path (best-effort)
-      //   4) isUserWallet
-      //   5) first
-      // -----------------------------------------------------------------------
       Account? chosen;
 
       bool looksLikeDefaultSolanaPath(Uri dp) {
@@ -423,25 +441,27 @@ class WalletConnectionProvider extends ChangeNotifier {
             s.contains("44%27/501%27/0%27");
       }
 
-      // (1) saved accountId
+      // Selection order:
+      // 1) saved accountId
+      // 2) saved pubkey
+      // 3) isUserWallet
+      // 4) default Solana path
+      // 5) first
       if (savedId != null) {
         chosen = firstWhereOrNull(accounts, (a) => a.id == savedId);
         if (chosen != null) log('choose: matched savedId=$savedId');
       }
 
-      // (2) saved pubkey
       if (chosen == null && savedPubkey != null && savedPubkey.isNotEmpty) {
         chosen = firstWhereOrNull(accounts, (a) => a.publicKeyEncoded == savedPubkey);
         if (chosen != null) log('choose: matched savedPubkey=$savedPubkey');
       }
 
-      // (3) isUserWallet FIRST
       chosen ??= firstWhereOrNull(accounts, (a) => a.isUserWallet == true);
       if (chosen != null && chosen.isUserWallet == true) {
         log('choose: matched isUserWallet acctId=${chosen.id}');
       }
 
-      // (4) default Solana derivation path SECOND (only if still null)
       if (chosen == null) {
         chosen = firstWhereOrNull(accounts, (a) => looksLikeDefaultSolanaPath(a.derivationPath));
         if (chosen != null) {
@@ -449,7 +469,6 @@ class WalletConnectionProvider extends ChangeNotifier {
         }
       }
 
-      // (5) first
       chosen ??= accounts.first;
 
       log(
@@ -457,18 +476,20 @@ class WalletConnectionProvider extends ChangeNotifier {
       );
 
       await _commitSeedVaultSession(newToken, chosen);
+
       _mwaAuthToken = null;
       await _storage.delete(key: _kMwaAuthToken);
 
       log('connected+persisted: pubkey=$_pubkey acct=$_seedVaultAccountId dp=$_seedVaultDerivationPath');
     } catch (e) {
-      _lastError = (e is WalletConnectError)
+      _lastError = e is WalletConnectError
           ? e
           : WalletConnectError(
               'Seed Vault connection failed',
               'Unable to connect to Seed Vault. Please try again.',
               debug: e.toString(),
             );
+
       warn(
         'failed: ${_lastError is WalletConnectError ? (_lastError as WalletConnectError).debug : e.toString()}',
       );
@@ -479,9 +500,12 @@ class WalletConnectionProvider extends ChangeNotifier {
   }
 
   // ---------------------------------------------------------------------------
-  // Seed Vault restore (no getParsedAccount-by-id)
+  // Restore helpers
   // ---------------------------------------------------------------------------
 
+  /// Attempts to restore a persisted Seed Vault token/account selection.
+  ///
+  /// Returns true when a persisted token still resolves to a valid account set.
   Future<bool> _tryRestoreSeedVault() async {
     try {
       final seedVault = SeedVault.instance;
@@ -499,7 +523,7 @@ class WalletConnectionProvider extends ChangeNotifier {
       final savedIdStr = await _storage.read(key: _kSeedVaultAccountId);
       final savedId = int.tryParse(savedIdStr ?? '');
 
-      final chosen = (savedId != null)
+      final chosen = savedId != null
           ? accounts.firstWhere(
               (a) => a.id == savedId,
               orElse: () => accounts.firstWhere((a) => a.isUserWallet == true, orElse: () => accounts.first),
@@ -508,25 +532,33 @@ class WalletConnectionProvider extends ChangeNotifier {
 
       _kind = WalletKind.seedVault;
       _pubkey = chosen.publicKeyEncoded;
-      await _storage.write(key: _kSeedVaultPubkey, value: _pubkey);
-
       _mwaAuthToken = null;
+
       _seedVaultAuthToken = token;
       _seedVaultAccountId = chosen.id;
       _seedVaultDerivationPath = chosen.derivationPath;
 
+      await _storage.write(key: _kSeedVaultPubkey, value: _pubkey);
+
       notifyListeners();
       return true;
     } catch (e) {
-      icLogger.i('[WalletConnection] _tryRestoreSeedVault (expected) failed: $e');
+      icLogger.i('[WalletConnection] _tryRestoreSeedVault failed (expected sometimes): $e');
       return false;
     }
   }
 
   // ---------------------------------------------------------------------------
-  // Seed Vault signing-session bootstrap (silent-first)
+  // Signing-session bootstrap
   // ---------------------------------------------------------------------------
 
+  /// Ensures a valid Seed Vault session exists before signing.
+  ///
+  /// Strategy:
+  /// 1. try in-memory token
+  /// 2. try persisted token
+  /// 3. try already-authorized seed sessions
+  /// 4. interactive authorize as a last resort
   Future<SeedVaultWalletSession> ensureSeedVaultSessionForSigning() async {
     final seedVault = SeedVault.instance;
     const purpose = Purpose.signSolanaTransaction;
@@ -536,44 +568,42 @@ class WalletConnectionProvider extends ChangeNotifier {
       throw WalletConnectError('Seed Vault unavailable', 'Seed Vault is not available on this device.');
     }
 
-    // 1) Try in-memory token
-    final mem = _seedVaultAuthToken;
-    if (mem != null) {
-      final accounts = await _tryAccountsForToken(mem);
+    final inMemoryToken = _seedVaultAuthToken;
+    if (inMemoryToken != null) {
+      final accounts = await _tryAccountsForToken(inMemoryToken);
       if (accounts != null) {
         final chosen = _chooseAccountFromAccounts(accounts);
-        return await _commitSeedVaultSession(mem, chosen);
+        return _commitSeedVaultSession(inMemoryToken, chosen);
       }
     }
 
-    // 2) Try persisted token
     final persistedStr = await _storage.read(key: _kSeedVaultAuthToken);
-    final persisted = _parseAuthToken(persistedStr);
-    if (persisted != null) {
-      final accounts = await _tryAccountsForToken(persisted);
+    final persistedToken = _parseAuthToken(persistedStr);
+    if (persistedToken != null) {
+      final accounts = await _tryAccountsForToken(persistedToken);
       if (accounts != null) {
         final chosen = _chooseAccountFromAccounts(accounts);
-        return await _commitSeedVaultSession(persisted, chosen);
+        return _commitSeedVaultSession(persistedToken, chosen);
       }
     }
 
-    // 3) Try already-authorized seed tokens (NO UI)
     final match = await _findMatchingAuthorizedSeedSession();
     if (match != null) {
       final token = match.$1;
-      final acct = match.$2;
-      return await _commitSeedVaultSession(token, acct);
+      final account = match.$2;
+      return _commitSeedVaultSession(token, account);
     }
 
-    // 4) Last resort: interactive
     try {
       final newToken = await seedVault.authorizeSeed(purpose);
       final accounts = await seedVault.getParsedAccounts(newToken);
+
       if (accounts.isEmpty) {
         throw WalletConnectError('Seed Vault has no accounts', 'No accounts were found in Seed Vault.');
       }
+
       final chosen = _chooseAccountFromAccounts(accounts);
-      return await _commitSeedVaultSession(newToken, chosen);
+      return _commitSeedVaultSession(newToken, chosen);
     } catch (e) {
       throw WalletConnectError(
         'Seed Vault locked',
@@ -583,170 +613,18 @@ class WalletConnectionProvider extends ChangeNotifier {
     }
   }
 
-  // These accounts are dynamic from the plugin; keep this untyped.
-  Future<List<dynamic>?> _tryAccountsForToken(int token) async {
-    try {
-      final accounts = await SeedVault.instance.getParsedAccounts(token);
-      return accounts.isEmpty ? null : accounts;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  dynamic _chooseAccountFromAccounts(List<dynamic> accounts) {
-    final savedId = _seedVaultAccountId;
-    if (savedId != null) {
-      for (final a in accounts) {
-        if (a.id == savedId) return a;
-      }
-    }
-    for (final a in accounts) {
-      if (a.isUserWallet == true) return a;
-    }
-    return accounts.first;
-  }
-
-  Future<SeedVaultWalletSession> _commitSeedVaultSession(int token, dynamic chosen) async {
-    final dp = chosen.derivationPath as Uri;
-
-    _kind = WalletKind.seedVault;
-    _pubkey = chosen.publicKeyEncoded as String?;
-    _seedVaultAuthToken = token;
-    _seedVaultAccountId = chosen.id as int?;
-    _seedVaultDerivationPath = dp;
-
-    await _storage.write(key: _kWalletKind, value: _kind!.storageValue);
-    await _storage.write(key: _kSeedVaultPubkey, value: _pubkey);
-    await _storage.write(key: _kSeedVaultAuthToken, value: token.toString());
-    final id = chosen.id as int?;
-    _seedVaultAccountId = id;
-
-    if (id == null || id <= 0) {
-      await _storage.delete(key: _kSeedVaultAccountId);
-    } else {
-      await _storage.write(key: _kSeedVaultAccountId, value: id.toString());
-    }
-    await _storage.write(key: _kSeedVaultDerivationPath, value: dp.toString());
-
-    notifyListeners();
-
-    return SeedVaultWalletSession(
-      pubkey: _pubkey!,
-      authToken: token,
-      accountId: _seedVaultAccountId!,
-      derivationPath: dp,
-    );
-  }
-
-  Future<List<int>> _getAuthorizedSeedTokens() async {
-    try {
-      final cursor = await SeedVault.instance.getAuthorizedSeeds();
-
-      final out = <int>[];
-      for (final row in cursor) {
-        final dynamic v = row['AuthorizedSeeds_AuthToken'];
-        if (v is int) {
-          out.add(v);
-        } else if (v is String) {
-          final parsed = int.tryParse(v);
-          if (parsed != null) out.add(parsed);
-        } else if (v != null) {
-          final m = RegExp(r'(\d+)').firstMatch(v.toString());
-          final parsed = m == null ? null : int.tryParse(m.group(1)!);
-          if (parsed != null) out.add(parsed);
-        }
-      }
-      return out;
-    } catch (e) {
-      icLogger.i('[WalletConnection] getAuthorizedSeeds failed (expected sometimes): $e');
-      return const [];
-    }
-  }
-
-  Future<(int, dynamic)?> _findMatchingAuthorizedSeedSession() async {
-    // Only trust in-memory pubkey if we are already in Seed Vault lane.
-    final memPk = (_kind == WalletKind.seedVault) ? _pubkey : null;
-    final savedPk = memPk ?? await _storage.read(key: _kSeedVaultPubkey);
-
-    final savedIdStr = await _storage.read(key: _kSeedVaultAccountId);
-    final parsedId = int.tryParse(savedIdStr ?? '');
-
-    // Treat 0 / negative as "not pinned"
-    final int? savedId = (parsedId != null && parsedId > 0) ? parsedId : null;
-
-    final tokens = await _getAuthorizedSeedTokens();
-    if (tokens.isEmpty) return null;
-
-    for (final t in tokens) {
-      final accounts = await _tryAccountsForToken(t);
-      if (accounts == null || accounts.isEmpty) continue;
-
-      // 1) Prefer matching by accountId (ONLY if it's a real pinned id)
-      if (savedId != null) {
-        for (final a in accounts) {
-          final int? id = a.id as int?;
-          if (id != null && id == savedId) return (t, a);
-        }
-      }
-
-      // 2) Then match by pubkey
-      if (savedPk != null && savedPk.isNotEmpty) {
-        for (final a in accounts) {
-          final String? pk = a.publicKeyEncoded as String?;
-          if (pk != null && pk == savedPk) return (t, a);
-        }
-      }
-    }
-
-    return null;
-  }
-
-  // in WalletConnectionProvider
-  void cancelConnectAttempt({String reason = 'cancelled'}) {
-    if (!_isConnecting) return;
-
-    icLogger.i('[WalletConnection] cancelConnectAttempt: $reason');
-
-    // If you add cancelActiveSession() to your MWA service, call it here:
-    // _mwa.cancelActiveSession();
-
-    _isConnecting = false;
-    _lastError = WalletConnectError('Cancelled', 'Connection cancelled.');
-    notifyListeners();
-  }
-
   // ---------------------------------------------------------------------------
-  // Helpers
+  // MWA signing-session bootstrap
   // ---------------------------------------------------------------------------
-  // In WalletConnectionProvider
-  // Future<void> refreshMwaSessionForSigning() async {
-  //   final t = _mwaAuthToken ?? await _storage.read(key: _kMwaAuthToken);
-  //   final pkB58 = (_kind == WalletKind.mwa ? _pubkey : null) ?? await _storage.read(key: _kMWAPubkey);
-
-  //   if (t == null || t.isEmpty) {
-  //     throw WalletConnectError('Not connected', 'Connect wallet first.');
-  //   }
-  //   if (pkB58 == null || pkB58.isEmpty) {
-  //     throw WalletConnectError('Not connected', 'Connect wallet first.');
-  //   }
-
-  //   // Restore into the Kotlin-backed service (non-interactive)
-  //   await _mwa.restoreSession(authTokenB64: t, activeAddressB58: pkB58);
-
-  //   // Keep provider state consistent
-  //   _kind = WalletKind.mwa;
-  //   _mwaAuthToken = t;
-  //   _pubkey = pkB58;
-
-  //   notifyListeners();
-  // }
 
   Future<void> ensureMwaConnectedForSigning() async {
     final savedToken = _mwaAuthToken ?? await _storage.read(key: _kMwaAuthToken);
+
     final savedPubkey = (_kind == WalletKind.mwa ? _pubkey : null) ?? await _storage.read(key: _kMWAPubkey);
 
     if (savedToken != null && savedToken.isNotEmpty && savedPubkey != null && savedPubkey.isNotEmpty) {
       final pkBytes = Uint8List.fromList(base58decode(savedPubkey));
+
       if (pkBytes.length != 32) {
         throw WalletConnectError(
           'Wallet session invalid',
@@ -784,40 +662,56 @@ class WalletConnectionProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  void _clearSeedVaultSigningOnlyMemory() {
-    _seedVaultAuthToken = null;
-    _seedVaultDerivationPath = null;
-    // keep accountId + pubkey/kind
-  }
+  // ---------------------------------------------------------------------------
+  // Disconnect
+  // ---------------------------------------------------------------------------
 
-  Future<void> disconnect({bool revoke = false}) async {
+  /// Disconnects the current wallet lane.
+  ///
+  /// For Seed Vault, when revoke=true:
+  /// - all currently authorized Seed Vault rows are deauthorized
+  /// - the provider waits briefly for Seed Vault/provider state to settle
+  /// - only then are local persisted values cleared
+  ///
+  /// That settle delay is intentional and prevents immediate reconnect failures.
+  Future<void> disconnect({bool revoke = true}) async {
+    icLogger.i('[WalletConnection] disconnect called kind=$_kind revoke=$revoke');
+
     if (_isConnecting || _isDisconnecting) return;
 
-    final kind = _kind;
-    final seedTokenStr = await _storage.read(key: _kSeedVaultAuthToken);
-    final seedAuthToken = _parseAuthToken(seedTokenStr);
+    final currentKind = _kind;
 
     _isDisconnecting = true;
     _lastError = null;
 
-    // Reset UI immediately
-    _resetInMemory();
-    notifyListeners();
-
     try {
-      await _clearPersisted();
+      if (currentKind == WalletKind.mwa) {
+        _resetInMemory();
+        notifyListeners();
 
-      if (kind == WalletKind.mwa) {
-        // IMPORTANT: always clear native MWA session state
+        await _clearPersisted();
         await _mwa.deauthorize(interactive: revoke);
-
-        // Give wallet/session teardown a brief moment before another connect
         await Future.delayed(const Duration(milliseconds: 800));
-      } else if (kind == WalletKind.seedVault) {
-        if (revoke && seedAuthToken != null) {
-          await SeedVault.instance.deauthorizeSeed(seedAuthToken);
-        }
+        return;
       }
+
+      if (currentKind == WalletKind.seedVault) {
+        icLogger.i('[SeedVault][disconnect] starting');
+
+        if (revoke) {
+          await _deauthorizeAllSeedVaultSessions();
+          await _waitForSeedVaultSync();
+        }
+
+        _resetInMemory();
+        notifyListeners();
+        await _clearPersisted();
+        return;
+      }
+
+      _resetInMemory();
+      notifyListeners();
+      await _clearPersisted();
     } catch (e) {
       icLogger.w('[WalletConnection] disconnect failed: $e');
       _lastError = e;
@@ -827,19 +721,188 @@ class WalletConnectionProvider extends ChangeNotifier {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Cancel
+  // ---------------------------------------------------------------------------
+
+  void cancelConnectAttempt({String reason = 'cancelled'}) {
+    if (!_isConnecting) return;
+
+    icLogger.i('[WalletConnection] cancelConnectAttempt: $reason');
+
+    // If needed later:
+    // _mwa.cancelActiveSession();
+
+    _isConnecting = false;
+    _lastError = WalletConnectError('Cancelled', 'Connection cancelled.');
+    notifyListeners();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Internal helpers
+  // ---------------------------------------------------------------------------
+
+  Future<List<dynamic>?> _tryAccountsForToken(int token) async {
+    try {
+      final accounts = await SeedVault.instance.getParsedAccounts(token);
+      return accounts.isEmpty ? null : accounts;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  dynamic _chooseAccountFromAccounts(List<dynamic> accounts) {
+    final savedId = _seedVaultAccountId;
+
+    if (savedId != null) {
+      for (final a in accounts) {
+        if (a.id == savedId) return a;
+      }
+    }
+
+    for (final a in accounts) {
+      if (a.isUserWallet == true) return a;
+    }
+
+    return accounts.first;
+  }
+
+  Future<SeedVaultWalletSession> _commitSeedVaultSession(int token, dynamic chosen) async {
+    final derivationPath = chosen.derivationPath as Uri;
+    final accountId = chosen.id as int?;
+    final pubkey = chosen.publicKeyEncoded as String?;
+
+    _kind = WalletKind.seedVault;
+    _pubkey = pubkey;
+    _seedVaultAuthToken = token;
+    _seedVaultAccountId = accountId;
+    _seedVaultDerivationPath = derivationPath;
+
+    await _storage.write(key: _kWalletKind, value: _kind!.storageValue);
+    await _storage.write(key: _kSeedVaultPubkey, value: _pubkey);
+    await _storage.write(key: _kSeedVaultAuthToken, value: token.toString());
+
+    if (accountId == null || accountId <= 0) {
+      await _storage.delete(key: _kSeedVaultAccountId);
+    } else {
+      await _storage.write(key: _kSeedVaultAccountId, value: accountId.toString());
+    }
+
+    await _storage.write(key: _kSeedVaultDerivationPath, value: derivationPath.toString());
+
+    notifyListeners();
+
+    return SeedVaultWalletSession(
+      pubkey: _pubkey!,
+      authToken: token,
+      accountId: _seedVaultAccountId!,
+      derivationPath: derivationPath,
+    );
+  }
+
+  /// Reads currently authorized Seed Vault row IDs.
+  ///
+  /// In this provider setup, the row `_id` is what we pass back into
+  /// `deauthorizeSeed(...)`.
+  Future<List<int>> _getAuthorizedSeedTokens() async {
+    try {
+      final rows = await SeedVault.instance.getAuthorizedSeeds();
+
+      final out = <int>[];
+      for (final row in rows) {
+        final dynamic value = row['_id'];
+
+        if (value is int) {
+          out.add(value);
+        } else if (value is String) {
+          final parsed = int.tryParse(value);
+          if (parsed != null) out.add(parsed);
+        } else if (value != null) {
+          final match = RegExp(r'(\d+)').firstMatch(value.toString());
+          final parsed = match == null ? null : int.tryParse(match.group(1)!);
+          if (parsed != null) out.add(parsed);
+        }
+      }
+
+      return out;
+    } catch (e) {
+      icLogger.i('[WalletConnection] getAuthorizedSeeds failed (expected sometimes): $e');
+      return const [];
+    }
+  }
+
+  Future<(int, dynamic)?> _findMatchingAuthorizedSeedSession() async {
+    final inMemoryPubkey = _kind == WalletKind.seedVault ? _pubkey : null;
+    final savedPubkey = inMemoryPubkey ?? await _storage.read(key: _kSeedVaultPubkey);
+
+    final savedIdStr = await _storage.read(key: _kSeedVaultAccountId);
+    final parsedId = int.tryParse(savedIdStr ?? '');
+    final savedId = parsedId != null && parsedId > 0 ? parsedId : null;
+
+    final tokens = await _getAuthorizedSeedTokens();
+    if (tokens.isEmpty) return null;
+
+    for (final token in tokens) {
+      final accounts = await _tryAccountsForToken(token);
+      if (accounts == null || accounts.isEmpty) continue;
+
+      if (savedId != null) {
+        for (final a in accounts) {
+          final int? id = a.id as int?;
+          if (id != null && id == savedId) return (token, a);
+        }
+      }
+
+      if (savedPubkey != null && savedPubkey.isNotEmpty) {
+        for (final a in accounts) {
+          final String? pk = a.publicKeyEncoded as String?;
+          if (pk != null && pk == savedPubkey) return (token, a);
+        }
+      }
+    }
+
+    return null;
+  }
+
+  Future<void> _deauthorizeAllSeedVaultSessions() async {
+    final tokens = await _getAuthorizedSeedTokens();
+    icLogger.i('[SeedVault][disconnect] revoking ${tokens.length} authorized session(s)');
+
+    for (final token in tokens) {
+      try {
+        await SeedVault.instance.deauthorizeSeed(token);
+      } catch (e) {
+        icLogger.w('[SeedVault][disconnect] failed to revoke token=$token error=$e');
+      }
+    }
+  }
+
+  Future<void> _waitForSeedVaultSync() async {
+    // Seed Vault/provider updates asynchronously after deauthorization.
+    await Future.delayed(const Duration(milliseconds: 500));
+  }
+
+  void _clearSeedVaultSigningOnlyMemory() {
+    _seedVaultAuthToken = null;
+    _seedVaultDerivationPath = null;
+    // Intentionally keep pubkey/kind/accountId if optimistic restore already ran.
+  }
+
   Future<void> _clearPersisted() async {
     await _storage.delete(key: _kWalletKind);
-    await _storage.delete(key: _kSeedVaultPubkey);
+
     await _storage.delete(key: _kMWAPubkey);
     await _storage.delete(key: _kMwaAuthToken);
+
+    await _storage.delete(key: _kSeedVaultPubkey);
     await _storage.delete(key: _kSeedVaultAuthToken);
     await _storage.delete(key: _kSeedVaultAccountId);
     await _storage.delete(key: _kSeedVaultDerivationPath);
   }
 
   void _resetInMemory() {
-    _pubkey = null;
     _kind = null;
+    _pubkey = null;
 
     _mwaAuthToken = null;
 
@@ -848,18 +911,19 @@ class WalletConnectionProvider extends ChangeNotifier {
     _seedVaultDerivationPath = null;
   }
 
-  int? _parseAuthToken(String? s) {
-    if (s == null) return null;
-    final direct = int.tryParse(s);
+  int? _parseAuthToken(String? value) {
+    if (value == null) return null;
+
+    final direct = int.tryParse(value);
     if (direct != null) return direct;
 
-    final m = RegExp(r'(\d+)').firstMatch(s);
-    return m == null ? null : int.tryParse(m.group(1)!);
+    final match = RegExp(r'(\d+)').firstMatch(value);
+    return match == null ? null : int.tryParse(match.group(1)!);
   }
 
-  T? firstWhereOrNull<T>(List<T> list, bool Function(T a) test) {
-    for (final a in list) {
-      if (test(a)) return a;
+  T? firstWhereOrNull<T>(List<T> list, bool Function(T item) test) {
+    for (final item in list) {
+      if (test(item)) return item;
     }
     return null;
   }

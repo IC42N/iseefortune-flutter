@@ -1,12 +1,14 @@
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
+import 'package:iseefortune_flutter/models/game_resolution/game_resolution_profile_result.dart';
 import 'package:iseefortune_flutter/models/prediction/prediction_model.dart';
 import 'package:iseefortune_flutter/models/prediction/prediciton_profile_row_vm.dart';
 import 'package:iseefortune_flutter/models/profile/profile_prediction_context.dart';
 import 'package:iseefortune_flutter/models/profile/profile_prediction_row_mapper.dart';
 import 'package:iseefortune_flutter/providers/live_feed_provider.dart';
 import 'package:iseefortune_flutter/providers/profile/profile_pda_provider.dart';
+import 'package:iseefortune_flutter/services/game/resolved_game_db_service.dart';
 import 'package:iseefortune_flutter/services/profile/player_predicitons_service.dart';
 import 'package:iseefortune_flutter/utils/logger.dart';
 
@@ -44,10 +46,12 @@ class PlayerPredictionsProvider extends ChangeNotifier {
   PlayerPredictionsProvider({
     required PlayerPredictionsService service,
     required ProfilePdaProvider profilePda,
+    required ResolvedGameApiService resolvedGameApi,
     this.pageSize = 20,
     this.maxItems = 40,
   }) : _service = service,
-       _profilePda = profilePda;
+       _profilePda = profilePda,
+       _resolvedGameApi = resolvedGameApi;
 
   // ---------------------------------------------------------------------------
   // Dependencies (other layers we rely on)
@@ -63,6 +67,8 @@ class PlayerPredictionsProvider extends ChangeNotifier {
   /// - The Profile PDA decode (player address + list of recent prediction PDAs)
   /// - A notify mechanism when that profile changes (new prediction key added)
   final ProfilePdaProvider _profilePda;
+
+  final ResolvedGameApiService _resolvedGameApi;
 
   /// Pagination controls:
   /// - pageSize: how many to fetch per chunk
@@ -92,6 +98,11 @@ class PlayerPredictionsProvider extends ChangeNotifier {
   /// (This grows when you loadMore())
   int _limit = 20;
   int get limit => _limit;
+
+  final Map<String, ResolvedGameProfileResult> _resolvedByGameKey = {};
+  Map<String, ResolvedGameProfileResult> get resolvedByGameKey => Map.unmodifiable(_resolvedByGameKey);
+
+  String _gameKey(BigInt gameEpoch, int tier) => '${gameEpoch.toString()}:$tier';
 
   /// Row overrides for UI (e.g. show optimistic/pending state).
   bool hasOverride(String pda) => _rowOverrides.containsKey(pda);
@@ -124,15 +135,23 @@ class PlayerPredictionsProvider extends ChangeNotifier {
   List<PredictionModel> get orderedModels =>
       _orderedKeys.map((k) => _byPubkey[k]).whereType<PredictionModel>().toList();
 
-  /// Converts PredictionModel -> UI row VM.
-  /// If an override exists for a PDA, it wins over the derived base row.
   List<ProfilePredictionRowVM> buildRows(ProfilePredictionContext ctx) {
+    final effectiveCtx = ProfilePredictionContext(currentEpoch: ctx.currentEpoch, winningByEpoch: const {});
+
     return _orderedKeys
         .map((pda) {
           final m = _byPubkey[pda];
           if (m == null) return null;
 
-          final base = mapPredictionModelToProfileRow(m: m, predictionPda: pda, ctx: ctx);
+          final resolved = _resolvedByGameKey[_gameKey(m.gameEpoch, m.tier)];
+
+          final base = mapPredictionModelToProfileRow(
+            m: m,
+            predictionPda: pda,
+            ctx: effectiveCtx,
+            resolved: resolved,
+          );
+
           return _rowOverrides[pda] ?? base;
         })
         .whereType<ProfilePredictionRowVM>()
@@ -263,6 +282,46 @@ class PlayerPredictionsProvider extends ChangeNotifier {
     super.dispose();
   }
 
+  Future<void> _hydrateResolvedGamesForLoadedPredictions() async {
+    final currentEpoch = _currentGameEpochOrZero();
+
+    if (currentEpoch == BigInt.zero) {
+      _resolvedByGameKey.clear();
+      return;
+    }
+
+    final deduped = <String, ResolvedGameLookupKey>{};
+
+    for (final pda in _orderedKeys) {
+      final m = _byPubkey[pda];
+      if (m == null) continue;
+
+      final key = _gameKey(m.gameEpoch, m.tier);
+      deduped[key] = ResolvedGameLookupKey(gameEpoch: m.gameEpoch, tier: m.tier);
+    }
+
+    final keysToResolve = deduped.values.toList()
+      ..sort((a, b) {
+        final epochCmp = b.gameEpoch.compareTo(a.gameEpoch);
+        if (epochCmp != 0) return epochCmp;
+        return b.tier.compareTo(a.tier);
+      });
+
+    icLogger.i('[Profile Predictions] hydrate resolved games keys=${keysToResolve.length}');
+
+    _resolvedByGameKey.clear();
+
+    if (keysToResolve.isEmpty) return;
+
+    final items = await _resolvedGameApi.getBatchByGameKeys(keysToResolve);
+
+    for (final item in items) {
+      _resolvedByGameKey[_gameKey(item.gameEpoch, item.tier)] = item;
+    }
+
+    icLogger.i('[Profile Predictions] hydrated resolved games=${_resolvedByGameKey.length}');
+  }
+
   // ---------------------------------------------------------------------------
   // User Actions (pagination)
   // ---------------------------------------------------------------------------
@@ -327,7 +386,12 @@ class PlayerPredictionsProvider extends ChangeNotifier {
 
     // If keys are unchanged and we already have all models decoded, we can skip.
     // We still re-evaluate subscriptions (epoch might have changed).
-    if (!force && listEquals(keys, _orderedKeys) && _byPubkey.length >= keys.length) {
+    final loadedModels = keys.where((k) => _byPubkey.containsKey(k)).length;
+
+    if (!force &&
+        listEquals(keys, _orderedKeys) &&
+        loadedModels >= keys.length &&
+        _resolvedByGameKey.isNotEmpty) {
       _reconcileLiveSubs(targetKeys: _pickMutable(keys));
       return;
     }
@@ -370,6 +434,11 @@ class PlayerPredictionsProvider extends ChangeNotifier {
       );
 
       // If a newer refresh started, stop.
+      if (token != _refreshToken) return;
+
+      // Hydrate exact winning history for the loaded past prediction epochs.
+      await _hydrateResolvedGamesForLoadedPredictions();
+
       if (token != _refreshToken) return;
 
       _isLoading = false;
@@ -429,6 +498,7 @@ class PlayerPredictionsProvider extends ChangeNotifier {
     _limit = pageSize;
     _orderedKeys = const [];
     _byPubkey.clear();
+    _resolvedByGameKey.clear();
     _rowOverrides.clear();
     _cancelAllLiveSubs();
     _safeNotify();
@@ -440,6 +510,7 @@ class PlayerPredictionsProvider extends ChangeNotifier {
     _lastError = null;
     _orderedKeys = const [];
     _byPubkey.clear();
+    _resolvedByGameKey.clear();
     _rowOverrides.clear();
     _cancelAllLiveSubs();
     _safeNotify();

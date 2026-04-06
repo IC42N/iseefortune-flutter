@@ -40,7 +40,7 @@ class ProfilePdaProvider extends ChangeNotifier {
   }
 
   void attachWalletConnection(WalletConnectionProvider walletConn) {
-    icLogger.i('[ProfilePdaProvider] attachWalletConnection initial=${walletConn.pubkey}');
+    //icLogger.i('[ProfilePdaProvider] attachWalletConnection initial=${walletConn.pubkey}');
 
     if (_walletConn != null && _walletListener != null) {
       _walletConn!.removeListener(_walletListener!);
@@ -56,7 +56,7 @@ class ProfilePdaProvider extends ChangeNotifier {
   void _handleWalletChanged(String? nextPubkey) {
     if (_walletPubkey == nextPubkey) return;
 
-    icLogger.i('[ProfilePdaProvider] wallet pubkey changed -> $nextPubkey');
+    //icLogger.i('[ProfilePdaProvider] wallet pubkey changed -> $nextPubkey');
     _walletPubkey = nextPubkey;
 
     if (nextPubkey == null) {
